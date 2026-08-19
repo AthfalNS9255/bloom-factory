@@ -13,12 +13,15 @@ pub fn parse_lockup_view_model(renderer: &Value) -> Option<ParsedItem> {
     let content_type = renderer.get("contentType")?.as_str()?;
     let content_id = renderer.get("contentId")?.as_str()?.to_string();
 
-    // Thumbnails
-    let thumbnails = if let Some(cvm) = renderer.get("contentImage") {
+    // Thumbnails: check contentImage first, fallback to entire lockupViewModel
+    let mut thumbnails = if let Some(cvm) = renderer.get("contentImage") {
         get_thumbnails(cvm)
     } else {
         Vec::new()
     };
+    if thumbnails.is_empty() {
+        thumbnails = get_thumbnails(renderer);
+    }
 
     let meta = renderer.get("metadata")?.get("lockupMetadataViewModel")?;
     let title = meta
@@ -107,23 +110,40 @@ pub fn nav<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-/// Extract concatenated text from `runs` array.
+/// Extract all runs text joined together.
 pub fn get_text(obj: &Value, key: &str) -> Option<String> {
-    let container = obj.get(key)?;
-    // First try "simpleText"
-    if let Some(text) = container.get("simpleText").and_then(|t| t.as_str()) {
-        return Some(text.to_string());
+    let target = if key.is_empty() {
+        obj
+    } else {
+        obj.get(key)?
+    };
+
+    // Case 1: Simple string
+    if let Some(s) = target.as_str() {
+        return Some(s.to_string());
     }
-    // Then try "runs" array
-    if let Some(runs) = container.get("runs").and_then(|r| r.as_array()) {
+
+    // Case 2: { simpleText: "..." }
+    if let Some(s) = target.get("simpleText").and_then(|v| v.as_str()) {
+        return Some(s.to_string());
+    }
+
+    // Case 3: { content: "..." } (view models)
+    if let Some(s) = target.get("content").and_then(|v| v.as_str()) {
+        return Some(s.to_string());
+    }
+
+    // Case 4: { runs: [ { text: "..." }, ... ] }
+    if let Some(runs) = target.get("runs").and_then(|r| r.as_array()) {
         let text: String = runs
             .iter()
-            .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
+            .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
             .collect();
         if !text.is_empty() {
             return Some(text);
         }
     }
+
     None
 }
 
@@ -149,67 +169,79 @@ fn clean_thumbnail_url(url: &str) -> String {
     }
 }
 
-/// Extract the best (largest) thumbnail URL from a thumbnail object.
-/// Extract thumbnail URLs as a list sorted by width.
+/// Extract thumbnail URLs from any YouTube JSON object, sorted by width.
 pub fn get_thumbnails(obj: &serde_json::Value) -> Vec<(String, u64)> {
-    // Standard YouTube and YouTube Music API have multiple thumbnail structures:
-    // 1. {thumbnail: {thumbnails: [...]}}
-    // 2. {thumbnail: {musicThumbnailRenderer: {thumbnail: {thumbnails: [...]}}}}  (most common in search/browse)
-    // 3. {thumbnails: [...]\}
-    // 4. {thumbnail: {croppedSquareThumbnailRenderer: {thumbnail: {thumbnails: [...]}}}}
-    // 5. {thumbnailViewModel: {image: {sources: [...]}}} (v2/view models)
-    // 6. {image: {sources: [...]}} (v2/view models)
-    // 7. {avatar: {sources: [...]}} (v2/view models)
-    // 8. {avatarViewModel: {image: {sources: [...]}}} (v2/view models)
-    let thumbs = obj
-        .get("thumbnail")
-        .or_else(|| obj.get("thumbnailRenderer"))
-        .or_else(|| obj.get("thumbnails"))
-        .or_else(|| obj.get("thumbnailViewModel"))
-        .or_else(|| obj.get("image"))
-        .or_else(|| obj.get("avatar"))
-        .or_else(|| obj.get("avatarViewModel"))
-        .and_then(|t| {
-            // Direct: {thumbnails: [...]\}
-            t.get("thumbnails")
-                .and_then(|a| a.as_array())
-                // New: {sources: [...]} (v2/view models)
-                .or_else(|| t.get("sources").and_then(|s| s.as_array()))
-                // Wrapped: {thumbnailViewModel: {image: {sources: [...]}}}
-                .or_else(|| {
-                    t.get("image")
-                        .and_then(|i| i.get("sources"))
-                        .and_then(|a| a.as_array())
-                })
-                // Wrapped: {musicThumbnailRenderer: {thumbnail: {thumbnails: [...]}}}
-                .or_else(|| {
-                    t.get("musicThumbnailRenderer")
-                        .and_then(|r| r.get("thumbnail"))
-                        .and_then(|t2| t2.get("thumbnails"))
-                        .and_then(|a| a.as_array())
-                })
-                // Wrapped: {croppedSquareThumbnailRenderer: {thumbnail: {thumbnails: [...]}}}
-                .or_else(|| {
-                    t.get("croppedSquareThumbnailRenderer")
-                        .and_then(|r| r.get("thumbnail"))
-                        .and_then(|t2| t2.get("thumbnails"))
-                        .and_then(|a| a.as_array())
-                })
-                // Fallback: the value itself is an array
-                .or_else(|| t.as_array())
-        });
-
     let mut result = Vec::new();
-    if let Some(arr) = thumbs {
-        for t in arr {
-            if let Some(url) = t.get("url").and_then(|u| u.as_str()) {
-                let w = t.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
-                result.push((clean_thumbnail_url(url), w));
+    collect_thumbnails_recursive(obj, &mut result, 0);
+    result.sort_by_key(|r| r.1);
+    result.dedup_by(|a, b| a.0 == b.0);
+    result
+}
+
+fn collect_thumbnails_recursive(val: &Value, out: &mut Vec<(String, u64)>, depth: usize) {
+    if depth > 7 {
+        return;
+    }
+    match val {
+        Value::Object(map) => {
+            // Check direct thumbnails / sources array
+            if let Some(arr) = map
+                .get("thumbnails")
+                .or_else(|| map.get("sources"))
+                .and_then(|v| v.as_array())
+            {
+                for t in arr {
+                    if let Some(url) = t.get("url").and_then(|u| u.as_str()) {
+                        let w = t.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
+                        out.push((clean_thumbnail_url(url), w));
+                    }
+                }
+            }
+
+            // Prioritize common thumbnail wrapper keys
+            for key in &[
+                "contentImage",
+                "collectionThumbnailViewModel",
+                "primaryThumbnail",
+                "thumbnailViewModel",
+                "image",
+                "thumbnail",
+                "thumbnailRenderer",
+                "playlistVideoThumbnailRenderer",
+                "playlistCustomThumbnailRenderer",
+                "musicThumbnailRenderer",
+                "croppedSquareThumbnailRenderer",
+                "thumbnailLandscapePortraitViewModel",
+                "avatar",
+                "avatarViewModel",
+                "decoratedAvatarViewModel",
+            ] {
+                if let Some(child) = map.get(*key) {
+                    collect_thumbnails_recursive(child, out, depth + 1);
+                }
+            }
+
+            // If still nothing found, inspect other object fields
+            if out.is_empty() {
+                for (k, child) in map {
+                    if k != "trackingParams" && k != "serviceTrackingParams" && k != "clickTrackingParams" {
+                        collect_thumbnails_recursive(child, out, depth + 1);
+                    }
+                }
             }
         }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(url) = item.get("url").and_then(|u| u.as_str()) {
+                    let w = item.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
+                    out.push((clean_thumbnail_url(url), w));
+                } else {
+                    collect_thumbnails_recursive(item, out, depth + 1);
+                }
+            }
+        }
+        _ => {}
     }
-    result.sort_by_key(|r| r.1);
-    result
 }
 
 pub fn get_thumbnail_url(obj: &Value) -> Option<String> {
@@ -846,94 +878,140 @@ pub fn parse_home_sections(data: &Value) -> Vec<HomeSectionData> {
 /// Parse first home page response and return sections + next section-list continuation token.
 pub fn parse_home_sections_page(data: &Value, section_index_offset: usize) -> HomeSectionsPage {
     let mut sections = Vec::new();
+    let mut next_page_token = None;
 
-    let grid = nav(
-        data,
-        "contents.twoColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.richGridRenderer",
-    );
-    if let Some(g) = grid {
-        if let Some(contents) = g.get("contents").and_then(|c| c.as_array()) {
-            let mut items = Vec::new();
-            for entry in contents {
-                if let Some(rich_item) = entry.get("richItemRenderer") {
-                    if let Some(vid) = rich_item
-                        .get("content")
-                        .and_then(|c| c.get("videoRenderer"))
-                    {
-                        if let Some(parsed) = parse_video_renderer(vid) {
-                            items.push(parsed);
+    let tabs = nav(data, "contents.twoColumnBrowseResultsRenderer.tabs")
+        .or_else(|| nav(data, "contents.singleColumnBrowseResultsRenderer.tabs"))
+        .and_then(|t| t.as_array());
+
+    if let Some(tabs_array) = tabs {
+        for tab in tabs_array {
+            let tab_content = tab.get("tabRenderer").and_then(|tr| tr.get("content"));
+            if let Some(content) = tab_content {
+                // 1. Check richGridRenderer
+                if let Some(grid) = content.get("richGridRenderer") {
+                    if next_page_token.is_none() {
+                        next_page_token = extract_continuation(grid);
+                    }
+                    if let Some(contents) = grid.get("contents").and_then(|c| c.as_array()) {
+                        let mut top_items = Vec::new();
+                        for entry in contents {
+                            if let Some(rich_item) = entry.get("richItemRenderer") {
+                                if let Some(item_content) = rich_item.get("content") {
+                                    if let Some(vid) = item_content.get("videoRenderer") {
+                                        if let Some(parsed) = parse_video_renderer(vid) {
+                                            top_items.push(parsed);
+                                        }
+                                    } else if let Some(lockup) = item_content.get("lockupViewModel") {
+                                        if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                            top_items.push(parsed);
+                                        }
+                                    }
+                                }
+                            } else if let Some(rich_section) = entry.get("richSectionRenderer") {
+                                if let Some(shelf) = rich_section
+                                    .get("content")
+                                    .and_then(|c| c.get("richShelfRenderer"))
+                                {
+                                    let title = get_text(shelf, "title")
+                                        .unwrap_or_else(|| format!("Shelf {}", sections.len() + 1));
+                                    let mut shelf_items = Vec::new();
+                                    if let Some(shelf_contents) = shelf.get("contents").and_then(|c| c.as_array()) {
+                                        for item in shelf_contents {
+                                            if let Some(rich_item) = item.get("richItemRenderer") {
+                                                if let Some(item_content) = rich_item.get("content") {
+                                                    if let Some(vid) = item_content.get("videoRenderer") {
+                                                        if let Some(parsed) = parse_video_renderer(vid) {
+                                                            shelf_items.push(parsed);
+                                                        }
+                                                    } else if let Some(lockup) = item_content.get("lockupViewModel") {
+                                                        if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                                            shelf_items.push(parsed);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !shelf_items.is_empty() {
+                                        sections.push(HomeSectionData {
+                                            id: format!("shelf_{}", sections.len() + section_index_offset),
+                                            title,
+                                            subtitle: None,
+                                            card_type: HomeCardKind::Carousel,
+                                            items: shelf_items,
+                                            more_token: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        if !top_items.is_empty() {
+                            sections.insert(
+                                0,
+                                HomeSectionData {
+                                    id: "recommended".to_string(),
+                                    title: "Recommended".to_string(),
+                                    subtitle: None,
+                                    card_type: HomeCardKind::Grid,
+                                    items: top_items,
+                                    more_token: next_page_token.clone(),
+                                },
+                            );
                         }
                     }
                 }
-            }
-            if !items.is_empty() {
-                sections.push(HomeSectionData {
-                    id: "trending".to_string(),
-                    title: "Trending".to_string(),
-                    subtitle: None,
-                    card_type: HomeCardKind::Grid,
-                    items,
-                    more_token: extract_continuation(g),
-                });
-            }
-        }
-    }
 
-    // Also look for shelfRenderer in sectionListRenderer
-    let sl = nav(
-        data,
-        "contents.twoColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer",
-    );
-    if let Some(sections_list) = sl
-        .and_then(|v| v.get("contents"))
-        .and_then(|a| a.as_array())
-    {
-        for (i, entry) in sections_list.iter().enumerate() {
-            if let Some(shelf) = entry.get("shelfRenderer") {
-                let title = get_text(shelf, "title").unwrap_or_else(|| format!("Section {}", i));
-                let mut items = Vec::new();
-                if let Some(shelf_contents) = shelf
-                    .get("content")
-                    .and_then(|c| c.get("horizontalListRenderer"))
-                    .and_then(|h| h.get("items"))
-                    .and_then(|a| a.as_array())
-                {
-                    for item in shelf_contents {
-                        if let Some(vid) = item.get("gridVideoRenderer") {
-                            if let Some(v_id) = vid.get("videoId").and_then(|v| v.as_str()) {
-                                let title = get_text(vid, "title").unwrap_or_default();
-                                items.push(ParsedItem::Track {
-                                    video_id: v_id.to_string(),
-                                    title,
-                                    artists: vec![],
-                                    album: None,
-                                    duration_ms: None,
-                                    thumbnails: get_thumbnails(vid),
-                                    is_explicit: false,
-                                });
+                // 2. Check sectionListRenderer
+                if let Some(sl) = content.get("sectionListRenderer") {
+                    if next_page_token.is_none() {
+                        next_page_token = extract_continuation(sl);
+                    }
+                    if let Some(sections_list) = sl.get("contents").and_then(|a| a.as_array()) {
+                        for (i, entry) in sections_list.iter().enumerate() {
+                            if let Some(shelf) = entry.get("shelfRenderer") {
+                                let title = get_text(shelf, "title").unwrap_or_else(|| format!("Section {}", i));
+                                let mut items = Vec::new();
+                                if let Some(shelf_contents) = shelf
+                                    .get("content")
+                                    .and_then(|c| c.get("horizontalListRenderer").or_else(|| c.get("gridRenderer")))
+                                    .and_then(|h| h.get("items"))
+                                    .and_then(|a| a.as_array())
+                                {
+                                    for item in shelf_contents {
+                                        if let Some(vid) = item.get("gridVideoRenderer").or_else(|| item.get("videoRenderer")) {
+                                            if let Some(parsed) = parse_video_renderer(vid) {
+                                                items.push(parsed);
+                                            }
+                                        }
+                                    }
+                                }
+                                if !items.is_empty() {
+                                    sections.push(HomeSectionData {
+                                        id: format!("shelf_{}", sections.len() + section_index_offset),
+                                        title,
+                                        subtitle: None,
+                                        card_type: HomeCardKind::Carousel,
+                                        items,
+                                        more_token: None,
+                                    });
+                                }
                             }
                         }
                     }
                 }
-                if !items.is_empty() {
-                    sections.push(HomeSectionData {
-                        id: format!("shelf_{}", i + section_index_offset),
-                        title,
-                        subtitle: None,
-                        card_type: HomeCardKind::Carousel,
-                        items,
-                        more_token: None,
-                    });
-                }
+            }
+
+            if !sections.is_empty() {
+                break;
             }
         }
     }
 
     HomeSectionsPage {
         sections,
-        next_page_token: grid
-            .and_then(extract_continuation)
-            .or_else(|| sl.and_then(extract_continuation)),
+        next_page_token,
     }
 }
 
@@ -1477,73 +1555,182 @@ fn parse_album_track_item(renderer: &Value, track_num: u32) -> Option<AlbumTrack
     })
 }
 
-/// Parse artist browse response.
+/// Parse artist / channel browse response.
 pub fn parse_artist_page(data: &Value) -> Option<ArtistData> {
-    let header = data
+    // 1. Channel Name
+    let name = data
         .get("header")
-        .and_then(|h| h.get("musicImmersiveHeaderRenderer"))
+        .and_then(|h| h.get("pageHeaderRenderer"))
+        .and_then(|p| p.get("content"))
+        .and_then(|c| c.get("pageHeaderViewModel"))
+        .and_then(|ph| ph.get("title"))
+        .and_then(|t| t.get("dynamicTextViewModel"))
+        .and_then(|d| d.get("text"))
+        .and_then(|t| t.get("content"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
         .or_else(|| {
             data.get("header")
-                .and_then(|h| h.get("musicVisualHeaderRenderer"))
+                .and_then(|h| h.get("c4TabbedHeaderRenderer"))
+                .and_then(|c| get_text(c, "title"))
         })
         .or_else(|| {
-            data.get("header")
-                .and_then(|h| h.get("musicResponseHeaderRenderer"))
-        });
-
-    let name = header
-        .and_then(|h| get_text(h, "title"))
+            data.get("metadata")
+                .and_then(|m| m.get("channelMetadataRenderer"))
+                .and_then(|c| get_text(c, "title"))
+        })
+        .or_else(|| {
+            data.get("microformat")
+                .and_then(|m| m.get("microformatDataRenderer"))
+                .and_then(|m| get_text(m, "title"))
+        })
         .unwrap_or_else(|| "Unknown Artist".to_string());
 
-    let thumbnails = header.map(|h| get_thumbnails(h)).unwrap_or_default();
-    let description = header.and_then(|h| get_text(h, "description"));
-
-    let browse_id = data
+    // 2. Thumbnails / Avatar
+    let thumbnails = data
         .get("header")
-        .and_then(|h| {
-            nav(h, "musicImmersiveHeaderRenderer.subscriptionButton.subscribeButtonRenderer.channelId")
-                .or_else(|| nav(h, "musicVisualHeaderRenderer.subscriptionButton.subscribeButtonRenderer.channelId"))
+        .and_then(|h| h.get("pageHeaderRenderer"))
+        .and_then(|p| p.get("content"))
+        .and_then(|c| c.get("pageHeaderViewModel"))
+        .and_then(|ph| ph.get("image"))
+        .and_then(|im| im.get("decoratedAvatarViewModel"))
+        .and_then(|dav| dav.get("avatarImage"))
+        .map(get_thumbnails)
+        .or_else(|| {
+            data.get("header")
+                .and_then(|h| h.get("c4TabbedHeaderRenderer"))
+                .and_then(|c| c.get("avatar"))
+                .map(get_thumbnails)
         })
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .or_else(|| {
+            data.get("metadata")
+                .and_then(|m| m.get("channelMetadataRenderer"))
+                .and_then(|c| c.get("avatar"))
+                .map(get_thumbnails)
+        })
         .unwrap_or_default();
 
-    // Parse sections from content
+    // 3. Description
+    let description = data
+        .get("metadata")
+        .and_then(|m| m.get("channelMetadataRenderer"))
+        .and_then(|c| get_text(c, "description"))
+        .or_else(|| {
+            data.get("microformat")
+                .and_then(|m| m.get("microformatDataRenderer"))
+                .and_then(|m| get_text(m, "description"))
+        });
+
+    // 4. Browse / Channel ID
+    let browse_id = data
+        .get("metadata")
+        .and_then(|m| m.get("channelMetadataRenderer"))
+        .and_then(|c| c.get("externalId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            data.get("header")
+                .and_then(|h| h.get("c4TabbedHeaderRenderer"))
+                .and_then(|c| c.get("channelId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+
+    // 5. Videos / Tracks
     let mut top_tracks = Vec::new();
-    let mut albums = Vec::new();
-    let mut singles = Vec::new();
-    let mut related_artists = Vec::new();
+    let albums = Vec::new();
+    let related_artists = Vec::new();
 
-    let section_list = nav(
-        data,
-        "contents.singleColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents",
-    );
+    // Parse tabs (Home, Videos, etc.)
+    if let Some(tabs) = nav(data, "contents.twoColumnBrowseResultsRenderer.tabs").and_then(|t| t.as_array()) {
+        for tab in tabs {
+            let content = tab.get("tabRenderer").and_then(|tr| tr.get("content"));
+            if let Some(content) = content {
+                // richGridRenderer
+                if let Some(grid) = content.get("richGridRenderer") {
+                    if let Some(contents) = grid.get("contents").and_then(|c| c.as_array()) {
+                        for entry in contents {
+                            if let Some(rich_item) = entry.get("richItemRenderer") {
+                                if let Some(item_content) = rich_item.get("content") {
+                                    if let Some(vid) = item_content.get("videoRenderer") {
+                                        if let Some(parsed) = parse_video_renderer(vid) {
+                                            top_tracks.push(parsed);
+                                        }
+                                    } else if let Some(lockup) = item_content.get("lockupViewModel") {
+                                        if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                            top_tracks.push(parsed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
-    if let Some(sections) = section_list.and_then(|v| v.as_array()) {
-        for section in sections {
-            if let Some(shelf) = section.get("musicShelfRenderer") {
-                let section_title = shelf
-                    .get("title")
-                    .and_then(|t| get_runs_text(t))
-                    .unwrap_or_default()
-                    .to_lowercase();
-
-                if section_title.contains("song") || section_title.contains("top") {
-                    if let Some(contents) = shelf.get("contents").and_then(|c| c.as_array()) {
-                        for item in contents {
-                            if let Some(renderer) = item.get("musicResponsiveListItemRenderer") {
-                                if let Some(mut parsed) = parse_music_responsive_item(renderer) {
-                                    if let ParsedItem::Track { .. } = parsed {
-                                        fill_missing_track_artists(
-                                            &mut parsed,
-                                            &name,
-                                            if browse_id.is_empty() {
-                                                None
-                                            } else {
-                                                Some(browse_id.as_str())
-                                            },
-                                        );
-                                        top_tracks.push(parsed);
+                // sectionListRenderer -> itemSectionRenderer -> shelfRenderer / gridRenderer / channelVideoPlayerRenderer
+                if let Some(sl) = content.get("sectionListRenderer") {
+                    if let Some(sections) = sl.get("contents").and_then(|s| s.as_array()) {
+                        for section in sections {
+                            if let Some(isr) = section.get("itemSectionRenderer") {
+                                if let Some(is_contents) = isr.get("contents").and_then(|c| c.as_array()) {
+                                    for is_item in is_contents {
+                                        if let Some(shelf) = is_item.get("shelfRenderer") {
+                                            if let Some(items) = shelf
+                                                .get("content")
+                                                .and_then(|c| c.get("horizontalListRenderer").or_else(|| c.get("gridRenderer")))
+                                                .and_then(|h| h.get("items"))
+                                                .and_then(|i| i.as_array())
+                                            {
+                                                for item in items {
+                                                    if let Some(vid) = item.get("gridVideoRenderer").or_else(|| item.get("videoRenderer")) {
+                                                        if let Some(parsed) = parse_video_renderer(vid) {
+                                                            top_tracks.push(parsed);
+                                                        }
+                                                    } else if let Some(lockup) = item.get("lockupViewModel") {
+                                                        if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                                            top_tracks.push(parsed);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(grid) = is_item.get("gridRenderer") {
+                                            if let Some(items) = grid.get("items").and_then(|i| i.as_array()) {
+                                                for item in items {
+                                                    if let Some(vid) = item.get("gridVideoRenderer").or_else(|| item.get("videoRenderer")) {
+                                                        if let Some(parsed) = parse_video_renderer(vid) {
+                                                            top_tracks.push(parsed);
+                                                        }
+                                                    } else if let Some(lockup) = item.get("lockupViewModel") {
+                                                        if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                                            top_tracks.push(parsed);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(vp) = is_item.get("channelVideoPlayerRenderer") {
+                                            if let Some(v_id) = vp.get("videoId").and_then(|v| v.as_str()) {
+                                                let title = get_text(vp, "title").unwrap_or_default();
+                                                let desc = get_text(vp, "description");
+                                                top_tracks.push(ParsedItem::Track {
+                                                    video_id: v_id.to_string(),
+                                                    title,
+                                                    artists: vec![(name.clone(), if browse_id.is_empty() { None } else { Some(browse_id.clone()) })],
+                                                    album: None,
+                                                    duration_ms: None,
+                                                    thumbnails: vec![],
+                                                    is_explicit: false,
+                                                });
+                                            }
+                                        } else if let Some(lockup) = is_item.get("lockupViewModel") {
+                                            if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                                top_tracks.push(parsed);
+                                            }
+                                        } else if let Some(vid) = is_item.get("videoRenderer") {
+                                            if let Some(parsed) = parse_video_renderer(vid) {
+                                                top_tracks.push(parsed);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1552,77 +1739,21 @@ pub fn parse_artist_page(data: &Value) -> Option<ArtistData> {
                 }
             }
 
-            if let Some(carousel) = section.get("musicCarouselShelfRenderer") {
-                let section_title = carousel
-                    .get("header")
-                    .and_then(|h| h.get("musicCarouselShelfBasicHeaderRenderer"))
-                    .and_then(|r| get_text(r, "title"))
-                    .unwrap_or_default()
-                    .to_lowercase();
-
-                if let Some(contents) = carousel.get("contents").and_then(|c| c.as_array()) {
-                    for item in contents {
-                        if let Some(renderer) = item.get("musicTwoRowItemRenderer") {
-                            if let Some(parsed) = parse_two_row_item(renderer) {
-                                if section_title.contains("album") {
-                                    albums.push(parsed);
-                                } else if section_title.contains("single")
-                                    || section_title.contains("ep")
-                                {
-                                    singles.push(parsed);
-                                } else if section_title.contains("fan")
-                                    || section_title.contains("like")
-                                    || section_title.contains("similar")
-                                {
-                                    related_artists.push(parsed);
-                                } else {
-                                    albums.push(parsed);
-                                }
-                            }
-                        }
-                    }
-                }
+            if !top_tracks.is_empty() {
+                break;
             }
         }
     }
 
-    // Merge albums and singles
-    albums.extend(singles);
-
-    let albums_browse_id = data
-        .get("contents")
-        .and_then(|c| nav(c, "singleColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents"))
-        .and_then(|c| c.as_array())
-        .and_then(|sections| {
-            sections.iter().find_map(|section| {
-                section.get("musicCarouselShelfRenderer").and_then(|carousel| {
-                    let section_title = carousel
-                        .get("header")
-                        .and_then(|h| h.get("musicCarouselShelfBasicHeaderRenderer"))
-                        .and_then(|r| get_text(r, "title"))
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    if section_title.contains("album") {
-                        carousel.get("header")
-                            .and_then(|h| nav(h, "musicCarouselShelfBasicHeaderRenderer.title.runs.0.navigationEndpoint.browseEndpoint.browseId"))
-                            .and_then(|id| id.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-        });
-
     Some(ArtistData {
-        browse_id,
         name,
+        browse_id,
         thumbnails,
         description,
         top_tracks,
         albums,
-        albums_browse_id,
         related_artists,
+        albums_browse_id: None,
     })
 }
 
@@ -1727,7 +1858,7 @@ fn parse_playlist_video_renderer(renderer: &Value, index: u32) -> Option<AlbumTr
 }
 
 fn parse_playlist_header(data: &Value) -> Option<PlaylistHeader> {
-    // Try Web format (pageHeaderRenderer)
+    // 1. Try Web format (pageHeaderRenderer)
     if let Some(ph) = data
         .get("header")
         .and_then(|h| h.get("pageHeaderRenderer"))
@@ -1753,7 +1884,6 @@ fn parse_playlist_header(data: &Value) -> Option<PlaylistHeader> {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string());
 
-        // Parse owner and tracks from metadataRows
         if let Some(rows) = ph
             .get("metadata")
             .and_then(|m| m.get("contentMetadataViewModel"))
@@ -1763,7 +1893,6 @@ fn parse_playlist_header(data: &Value) -> Option<PlaylistHeader> {
             for row in rows {
                 if let Some(parts) = row.get("metadataParts").and_then(|p| p.as_array()) {
                     for part in parts {
-                        // Avatar stack indicates owner
                         if part.get("avatarStack").is_some() {
                             if let Some(text) = part
                                 .get("text")
@@ -1782,7 +1911,8 @@ fn parse_playlist_header(data: &Value) -> Option<PlaylistHeader> {
                                     .replace("videos", "")
                                     .replace("tracks", "")
                                     .replace("video", "")
-                                    .replace(",", "")
+                                    .replace("track", "")
+                                    .replace(',', "")
                                     .trim()
                                     .to_string();
                                 if let Ok(count) = cleaned.parse::<u32>() {
@@ -1806,7 +1936,56 @@ fn parse_playlist_header(data: &Value) -> Option<PlaylistHeader> {
         });
     }
 
-    // Fallback older formats
+    // 2. Try Standard YouTube Desktop sidebar (playlistSidebarRenderer)
+    if let Some(sidebar) = data.get("sidebar").and_then(|s| s.get("playlistSidebarRenderer")) {
+        if let Some(items) = sidebar.get("items").and_then(|i| i.as_array()) {
+            let primary = items.first().and_then(|i| i.get("playlistSidebarPrimaryInfoRenderer"));
+            let secondary = items.get(1).and_then(|i| i.get("playlistSidebarSecondaryInfoRenderer"));
+
+            if let Some(pri) = primary {
+                let title = get_text(pri, "title").unwrap_or_default();
+                let description = get_text(pri, "description");
+                let thumbnails = get_thumbnails(pri);
+
+                let mut track_count = None;
+                if let Some(stats) = pri.get("stats").and_then(|s| s.as_array()) {
+                    for stat in stats {
+                        if let Some(text) = get_runs_text(stat).or_else(|| get_text(stat, "simpleText")) {
+                            if text.contains("video") || text.contains("track") {
+                                let cleaned = text
+                                    .replace("videos", "")
+                                    .replace("tracks", "")
+                                    .replace("video", "")
+                                    .replace("track", "")
+                                    .replace(',', "")
+                                    .trim()
+                                    .to_string();
+                                if let Ok(count) = cleaned.parse::<u32>() {
+                                    track_count = Some(count);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let owner = secondary.and_then(|sec| {
+                    sec.get("videoOwner")
+                        .and_then(|vo| vo.get("videoOwnerRenderer"))
+                        .and_then(|vor| get_text(vor, "title"))
+                });
+
+                return Some(PlaylistHeader {
+                    title,
+                    owner,
+                    track_count,
+                    thumbnails,
+                    description,
+                });
+            }
+        }
+    }
+
+    // 3. Fallback older formats
     let header = data
         .get("header")
         .and_then(|h| {
@@ -1819,99 +1998,120 @@ fn parse_playlist_header(data: &Value) -> Option<PlaylistHeader> {
             nav(data, "contents.twoColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents.0.musicResponsiveHeaderRenderer")
         });
 
-    let header = header?;
+    if let Some(header) = header {
+        let title = get_text(header, "title").unwrap_or_default();
+        let thumbnails = get_thumbnails(header);
 
-    let title = get_text(header, "title")?;
-    let thumbnails = get_thumbnails(header);
-
-    let subtitle = get_text(header, "subtitle").or_else(|| get_text(header, "straplineTextOne"));
-    let owner = header
-        .get("ownerText")
-        .and_then(|s| get_runs_text(s))
-        .or_else(|| {
-            header
-                .get("straplineTextOne")
-                .and_then(|s| get_runs_text(s))
-        })
-        .or_else(|| {
-            subtitle.as_ref().and_then(|sub| {
-                let parts: Vec<&str> = sub.split(" • ").collect();
-                parts.first().map(|s| s.to_string())
+        let subtitle = get_text(header, "subtitle").or_else(|| get_text(header, "straplineTextOne"));
+        let owner = header
+            .get("ownerText")
+            .and_then(|s| get_runs_text(s))
+            .or_else(|| {
+                header
+                    .get("straplineTextOne")
+                    .and_then(|s| get_runs_text(s))
             })
-        });
-
-    let track_count = header
-        .get("numVideosText")
-        .and_then(|s| get_text(header, "numVideosText"))
-        .and_then(|s| {
-            s.replace("videos", "")
-                .replace(",", "")
-                .trim()
-                .parse::<u32>()
-                .ok()
-        })
-        .or_else(|| {
-            header
-                .get("secondSubtitle")
-                .and_then(|s| s.get("runs"))
-                .and_then(|r| r.as_array())
-                .and_then(|runs| {
-                    for run in runs {
-                        let text = run.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                        let cleaned = text
-                            .trim()
-                            .replace(" videos", "")
-                            .replace(" tracks", "")
-                            .replace(" track", "")
-                            .replace(",", "");
-                        if let Ok(count) = cleaned.parse::<u32>() {
-                            return Some(count);
-                        }
-                    }
-                    None
+            .or_else(|| {
+                subtitle.as_ref().and_then(|sub| {
+                    let parts: Vec<&str> = sub.split(" • ").collect();
+                    parts.first().map(|s| s.to_string())
                 })
+            });
+
+        let track_count = header
+            .get("numVideosText")
+            .and_then(|s| get_text(header, "numVideosText"))
+            .and_then(|s| {
+                s.replace("videos", "")
+                    .replace(',', "")
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+            });
+
+        let description =
+            get_text(header, "description").or_else(|| get_text(header, "descriptionText"));
+
+        return Some(PlaylistHeader {
+            title,
+            owner,
+            track_count,
+            thumbnails,
+            description,
         });
+    }
 
-    let description =
-        get_text(header, "description").or_else(|| get_text(header, "descriptionText"));
+    // 4. Fallback to microformat
+    if let Some(mf) = data.get("microformat").and_then(|m| m.get("microformatDataRenderer")) {
+        let title = get_text(mf, "title").unwrap_or_default();
+        let description = get_text(mf, "description");
+        let thumbnails = get_thumbnails(mf);
 
-    Some(PlaylistHeader {
-        title,
-        owner,
-        track_count,
-        thumbnails,
-        description,
-    })
+        return Some(PlaylistHeader {
+            title,
+            owner: None,
+            track_count: None,
+            thumbnails,
+            description,
+        });
+    }
+
+    None
 }
 
 fn parse_playlist_tracks(data: &Value) -> (Vec<AlbumTrack>, Option<String>) {
     let mut tracks = Vec::new();
     let mut continuation = None;
 
-    // Web YouTube Format: playlistVideoListRenderer inside sectionListRenderer
-    let contents = nav(data, "contents.twoColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents").and_then(|c| c.as_array());
+    // Web YouTube Format: playlistVideoListRenderer or lockupViewModel inside sectionListRenderer
+    let contents = nav(data, "contents.twoColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents")
+        .or_else(|| nav(data, "contents.singleColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents"))
+        .and_then(|c| c.as_array());
+
     if let Some(sections) = contents {
         for section in sections {
             if let Some(isr) = section.get("itemSectionRenderer") {
                 if let Some(item_contents) = isr.get("contents").and_then(|c| c.as_array()) {
                     for ic in item_contents {
                         if let Some(pl) = ic.get("playlistVideoListRenderer") {
-                            if let Some(pl_contents) = pl.get("contents").and_then(|c| c.as_array())
-                            {
+                            if let Some(pl_contents) = pl.get("contents").and_then(|c| c.as_array()) {
                                 for item in pl_contents {
                                     if let Some(renderer) = item.get("playlistVideoRenderer") {
                                         let idx = (tracks.len() + 1) as u32;
-                                        if let Some(t) =
-                                            parse_playlist_video_renderer(renderer, idx)
-                                        {
+                                        if let Some(t) = parse_playlist_video_renderer(renderer, idx) {
                                             tracks.push(t);
+                                        }
+                                    } else if let Some(lockup) = item.get("lockupViewModel") {
+                                        let idx = (tracks.len() + 1) as u32;
+                                        if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                            if let Some(t) = parsed_track_to_album_track(parsed, idx) {
+                                                tracks.push(t);
+                                            }
                                         }
                                     }
                                 }
                             }
-                            // Inline continuations sometimes
                             if let Some(cont) = extract_continuation(pl) {
                                 continuation = Some(cont);
+                            }
+                        } else if let Some(lockup) = ic.get("lockupViewModel") {
+                            let idx = (tracks.len() + 1) as u32;
+                            if let Some(parsed) = parse_lockup_view_model(lockup) {
+                                if let Some(t) = parsed_track_to_album_track(parsed, idx) {
+                                    tracks.push(t);
+                                }
+                            }
+                        } else if let Some(renderer) = ic.get("playlistVideoRenderer") {
+                            let idx = (tracks.len() + 1) as u32;
+                            if let Some(t) = parse_playlist_video_renderer(renderer, idx) {
+                                tracks.push(t);
+                            }
+                        } else if let Some(renderer) = ic.get("videoRenderer") {
+                            let idx = (tracks.len() + 1) as u32;
+                            if let Some(parsed) = parse_video_renderer(renderer) {
+                                if let Some(t) = parsed_track_to_album_track(parsed, idx) {
+                                    tracks.push(t);
+                                }
                             }
                         }
                     }
@@ -1930,7 +2130,7 @@ fn parse_playlist_tracks(data: &Value) -> (Vec<AlbumTrack>, Option<String>) {
     }
 
     if tracks.is_empty() {
-        // Fallback older fallback
+        // Fallback older formats
         if let Some(shelf) = nav(data, "contents.singleColumnBrowseResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents.0.musicShelfRenderer") {
             if let Some(contents) = shelf.get("contents").and_then(|c| c.as_array()) {
                 for (i, item) in contents.iter().enumerate() {
@@ -1946,6 +2146,29 @@ fn parse_playlist_tracks(data: &Value) -> (Vec<AlbumTrack>, Option<String>) {
     }
 
     (tracks, continuation)
+}
+
+fn parsed_track_to_album_track(parsed: ParsedItem, idx: u32) -> Option<AlbumTrack> {
+    match parsed {
+        ParsedItem::Track {
+            video_id,
+            title,
+            artists,
+            duration_ms,
+            thumbnails,
+            is_explicit,
+            ..
+        } => Some(AlbumTrack {
+            video_id,
+            title,
+            artists,
+            duration_ms,
+            track_number: Some(idx),
+            is_explicit,
+            thumbnails,
+        }),
+        _ => None,
+    }
 }
 
 /// Parse continuation response for additional tracks (album or playlist pagination).

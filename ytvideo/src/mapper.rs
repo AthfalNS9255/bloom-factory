@@ -470,9 +470,8 @@ fn is_yt_video_thumbnail(url: &str) -> bool {
     url.contains("i.ytimg.com") || url.contains("img.youtube.com")
 }
 
-/// For googleusercontent.com thumbnails, generate a high-resolution version
-/// by replacing the `=wNNN-hNNN` suffix with a larger size.
-/// YTM returns small sizes (60px, 120px) but the server supports up to ~576px.
+/// For googleusercontent.com / ggpht.com thumbnails, generate a high-resolution version
+/// by replacing the `=wNNN-hNNN` or `=sNNN` suffix with a target size.
 fn ytm_high_res_url(url: &str, target_px: u32) -> String {
     if !url.contains("googleusercontent.com")
         && !url.contains("ggpht.com")
@@ -480,11 +479,11 @@ fn ytm_high_res_url(url: &str, target_px: u32) -> String {
     {
         return url.to_string();
     }
-    // URL suffix format: =w60-h60-l90-rj  or =w60-h60  or similar
+    // URL suffix format: =w60-h60-l90-rj  or =s88-c-k-c0x00ffffff-no-rj or =w60-h60
     if let Some(eq_pos) = url.rfind('=') {
         let base = &url[..eq_pos];
         let params = &url[eq_pos + 1..];
-        // Replace w and h numeric values
+        // Replace w, h, or s numeric values
         let new_params = params
             .split('-')
             .map(|p| {
@@ -495,6 +494,11 @@ fn ytm_high_res_url(url: &str, target_px: u32) -> String {
                     && p[1..].chars().all(|c| c.is_ascii_digit())
                 {
                     format!("h{target_px}")
+                } else if p.len() > 1
+                    && p.starts_with('s')
+                    && p[1..].chars().all(|c| c.is_ascii_digit())
+                {
+                    format!("s{target_px}")
                 } else {
                     p.to_string()
                 }
@@ -506,44 +510,95 @@ fn ytm_high_res_url(url: &str, target_px: u32) -> String {
     url.to_string()
 }
 
+fn extract_video_id_from_yt_thumb(url: &str) -> Option<String> {
+    if let Some(pos) = url.find("/vi/") {
+        let rest = &url[pos + 4..];
+        let id = rest.split('/').next()?;
+        if !id.is_empty() && !id.contains('?') {
+            return Some(id.to_string());
+        }
+    }
+    if let Some(pos) = url.find("/vi_webp/") {
+        let rest = &url[pos + 9..];
+        let id = rest.split('/').next()?;
+        if !id.is_empty() && !id.contains('?') {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 fn thumbnail_to_artwork(thumbnails: &[(String, u64)]) -> Artwork {
     if thumbnails.is_empty() {
         return empty_artwork(ImageLayout::Square);
     }
 
-    // Prefer YTM-specific square art (lh3.googleusercontent.com / yt3.ggpht.com)
-    // over standard YouTube video thumbnails (i.ytimg.com, 16:9).
+    // Prefer YTM/Google-specific art (googleusercontent.com / ggpht.com)
+    // over standard YouTube video thumbnails (i.ytimg.com).
     let ytm_thumbs: Vec<&(String, u64)> = thumbnails
         .iter()
         .filter(|(url, _)| is_ytm_thumbnail(url))
         .collect();
 
-    let (working, layout, is_ytm): (Vec<&(String, u64)>, ImageLayout, bool) =
-        if !ytm_thumbs.is_empty() {
-            (ytm_thumbs, ImageLayout::Square, true)
-        } else if thumbnails.iter().any(|(url, _)| is_yt_video_thumbnail(url)) {
-            // Standard YouTube 16:9 video thumbnail
-            (thumbnails.iter().collect(), ImageLayout::Landscape, false)
-        } else {
-            // Unknown origin — default to square (album art context)
-            (thumbnails.iter().collect(), ImageLayout::Square, false)
+    if !ytm_thumbs.is_empty() {
+        let best_url = &ytm_thumbs.last().unwrap().0;
+        let high = Some(ytm_high_res_url(best_url, 800));
+        let medium = ytm_high_res_url(best_url, 400);
+        let low = Some(ytm_high_res_url(best_url, 120));
+
+        return Artwork {
+            url: medium,
+            url_low: low,
+            url_high: high,
+            layout: ImageLayout::Square,
         };
+    }
 
-    let low = working.first().map(|(u, _)| (*u).clone());
+    // Check for YouTube video thumbnails (i.ytimg.com)
+    let yt_video_thumbs: Vec<&(String, u64)> = thumbnails
+        .iter()
+        .filter(|(url, _)| is_yt_video_thumbnail(url))
+        .collect();
 
-    // For YTM thumbnails: generate a high-res variant (the server supports up to ~576px).
-    // For others: use the largest available.
-    let high = if is_ytm {
-        working.last().map(|(u, _)| ytm_high_res_url(u, 576))
-    } else {
-        working.last().map(|(u, _)| (*u).clone())
-    };
+    if !yt_video_thumbs.is_empty() {
+        let sample_url = &yt_video_thumbs.last().unwrap().0;
+        if let Some(vid) = extract_video_id_from_yt_thumb(sample_url) {
+            let high = Some(format!("https://i.ytimg.com/vi/{vid}/hq720.jpg"));
+            let medium = format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg");
+            let low = Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
 
-    // Pick the size closest to 300px for the default url
-    let medium = working
+            return Artwork {
+                url: medium,
+                url_low: low,
+                url_high: high,
+                layout: ImageLayout::Landscape,
+            };
+        }
+
+        let low = yt_video_thumbs.first().map(|(u, _)| (*u).clone());
+        let high = yt_video_thumbs.last().map(|(u, _)| (*u).clone());
+        let medium = yt_video_thumbs
+            .iter()
+            .min_by_key(|(_, w)| (*w as i64 - 300).abs())
+            .map(|(u, _)| (*u).clone())
+            .or_else(|| low.clone())
+            .unwrap_or_default();
+
+        return Artwork {
+            url: medium,
+            url_low: low,
+            url_high: high,
+            layout: ImageLayout::Landscape,
+        };
+    }
+
+    // Generic thumbnails
+    let low = thumbnails.first().map(|(u, _)| u.clone());
+    let high = thumbnails.last().map(|(u, _)| u.clone());
+    let medium = thumbnails
         .iter()
         .min_by_key(|(_, w)| (*w as i64 - 300).abs())
-        .map(|(u, _)| (*u).clone())
+        .map(|(u, _)| u.clone())
         .or_else(|| low.clone())
         .unwrap_or_default();
 
@@ -551,7 +606,7 @@ fn thumbnail_to_artwork(thumbnails: &[(String, u64)]) -> Artwork {
         url: medium,
         url_low: low,
         url_high: high,
-        layout,
+        layout: ImageLayout::Square,
     }
 }
 

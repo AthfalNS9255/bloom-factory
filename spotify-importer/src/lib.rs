@@ -387,9 +387,41 @@ fn token_from_client_credentials() -> Option<AccessToken> {
     Some(AccessToken { token, expires_at })
 }
 
+fn token_from_official_embed_seeds() -> Option<AccessToken> {
+    let seeds = [
+        "https://open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGoYBM5M",
+        "https://open.spotify.com/embed/playlist/37i9dQZEVXbMDoHDwVN2tF",
+        "https://open.spotify.com/embed/playlist/37i9dQZF1DWXRqgorJj26U",
+    ];
+    for url in seeds {
+        let resp = http::get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Referer", "https://open.spotify.com/")
+            .timeout(15)
+            .send()
+            .ok()?;
+
+        if (200..300).contains(&resp.status) {
+            if let Ok(html) = String::from_utf8(resp.body) {
+                if let Some(tok) = token_from_embed_html(&html) {
+                    return Some(tok);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn get_access_token(kind: &str, id: &str) -> Result<String, String> {
     let candidates = [
         token_from_embed(kind, id),
+        token_from_official_embed_seeds(),
         token_from_anonymous_endpoint(),
         token_from_client_credentials(),
     ];
@@ -948,7 +980,87 @@ fn entity_from_embed(kind: &str, id: &str) -> Result<Value, String> {
         .ok_or("Embed entity not found in __NEXT_DATA__ payload".to_string())
 }
 
-// ── Collection info (API) ────────────────────────────────────────────────────
+// ── Collection info (API & Partner) ──────────────────────────────────────────
+
+fn get_playlist_info_via_partner(id: &str, token: &str) -> Result<CollectionSummary, String> {
+    let op_hash = extract_partner_hash_for_operation("fetchPlaylist")
+        .ok_or_else(|| "Could not locate fetchPlaylist persisted-query hash".to_string())?;
+
+    let body = serde_json::json!({
+        "operationName": "fetchPlaylist",
+        "variables": {
+            "uri": format!("spotify:playlist:{id}"),
+            "offset": 0,
+            "limit": 1,
+            "enableWatchFeedEntrypoint": false,
+        },
+        "extensions": {
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": op_hash,
+            }
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
+    let resp = http::post("https://api-partner.spotify.com/pathfinder/v1/query")
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Referer", "https://open.spotify.com/")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .body(body_bytes)
+        .timeout(30)
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("Partner API HTTP {}", resp.status));
+    }
+
+    let text = String::from_utf8(resp.body).map_err(|e| e.to_string())?;
+    let data: Value = serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {e}"))?;
+
+    let pl = data
+        .pointer("/data/playlistV2")
+        .ok_or_else(|| "Missing playlistV2 in response".to_string())?;
+
+    let title = pl
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if title.is_empty() {
+        return Err("Empty playlist title in partner response".to_string());
+    }
+
+    let description = pl
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let owner = pl
+        .pointer("/ownerV2/data/name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let thumbnail_url = pl
+        .pointer("/images/items/0/sources/0/url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let track_count = pl
+        .pointer("/content/totalCount")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+
+    Ok(CollectionSummary {
+        title,
+        kind: CollectionType::Playlist,
+        description,
+        owner,
+        thumbnail_url,
+        track_count,
+    })
+}
 
 fn get_playlist_info_via_api(id: &str, token: &str) -> Result<CollectionSummary, String> {
     let data = api_get(
@@ -1390,39 +1502,39 @@ impl Guest for Component {
         let kind_str = kind.as_str();
 
         let token = get_access_token(kind_str, &id);
-        let api_attempt = match token.as_ref() {
-            Ok(tok) => match &kind {
-                SpotifyKind::Playlist => get_playlist_info_via_api(&id, tok),
-                SpotifyKind::Album => get_album_info_via_api(&id, tok),
-            },
-            Err(e) => Err(e.clone()),
-        };
 
-        match api_attempt {
-            Ok(mut info) => {
-                if let (SpotifyKind::Playlist, Ok(tok)) = (&kind, token.as_ref()) {
+        match &kind {
+            SpotifyKind::Playlist => {
+                if let Ok(tok) = token.as_ref() {
+                    if let Ok(info) = get_playlist_info_via_partner(&id, tok) {
+                        return Ok(info);
+                    }
+                    if let Ok(mut info) = get_playlist_info_via_api(&id, tok) {
+                        if let Some(count) = get_playlist_track_count_resilient(&id, tok) {
+                            info.track_count = Some(count);
+                        }
+                        return Ok(info);
+                    }
+                }
+                let mut info = get_playlist_info_via_embed(&id)?;
+                if let Ok(tok) = token.as_ref() {
                     if let Some(count) = get_playlist_track_count_resilient(&id, tok) {
                         info.track_count = Some(count);
                     }
                 }
                 Ok(info)
             }
-            Err(api_err) => match &kind {
-                SpotifyKind::Playlist => {
-                    let mut info = get_playlist_info_via_embed(&id)
-                        .map_err(|embed_err| format!("API failed: {api_err}; embed fallback failed: {embed_err}"))?;
-
-                    if let Ok(tok) = token.as_ref() {
-                        if let Some(count) = get_playlist_track_count_resilient(&id, tok) {
-                            info.track_count = Some(count);
-                        }
-                    }
-
-                    Ok(info)
+            SpotifyKind::Album => {
+                if let Ok(info) = get_album_info_via_embed(&id) {
+                    return Ok(info);
                 }
-                SpotifyKind::Album => get_album_info_via_embed(&id)
-                    .map_err(|embed_err| format!("API failed: {api_err}; embed fallback failed: {embed_err}")),
-            },
+                if let Ok(tok) = token.as_ref() {
+                    if let Ok(info) = get_album_info_via_api(&id, tok) {
+                        return Ok(info);
+                    }
+                }
+                get_album_info_via_embed(&id)
+            }
         }
     }
 
@@ -1450,11 +1562,21 @@ impl Guest for Component {
                 }
                 Err(_) => get_playlist_tracks_via_embed(&id)?,
             },
-            SpotifyKind::Album => match token {
-                Ok(tok) => get_album_tracks_via_api(&id, &tok)
-                    .or_else(|_| get_album_tracks_via_embed(&id))?,
-                Err(_) => get_album_tracks_via_embed(&id)?,
-            },
+            SpotifyKind::Album => {
+                if let Ok(tracks) = get_album_tracks_via_embed(&id) {
+                    if !tracks.is_empty() {
+                        return Ok(Tracks { items: tracks });
+                    }
+                }
+                if let Ok(tok) = token.as_ref() {
+                    if let Ok(tracks) = get_album_tracks_via_api(&id, tok) {
+                        if !tracks.is_empty() {
+                            return Ok(Tracks { items: tracks });
+                        }
+                    }
+                }
+                get_album_tracks_via_embed(&id)?
+            }
         };
 
         Ok(Tracks { items })
