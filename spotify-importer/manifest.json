@@ -2,7 +2,7 @@
   "manifest_version": "1.0",
   "id": "content-importer.bloomfactory.spotifyimporter",
   "name": "spotify-importer",
-  "version": "2",
+  "version": "4",
   "type": "content-importer",
   "thumbnail_url": "https://www.scdn.co/i/_global/favicon.png",
   "publisher": {"name": "bloomfactory"},

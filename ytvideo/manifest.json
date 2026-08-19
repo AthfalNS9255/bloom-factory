@@ -2,7 +2,7 @@
   "manifest_version": "1.0",
   "id": "content-resolver.bloomfactory.ytvideo",
   "name": "ytvideo",
-  "version": "1",
+  "version": "4",
   "type": "content-resolver",
   "thumbnail_url": "https://www.gstatic.com/youtube/img/branding/favicon/favicon_144x144.png",
   "publisher": {"name": "bloomfactory"},
