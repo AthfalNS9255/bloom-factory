@@ -25,16 +25,16 @@ const CLIENT_VERSION: &str = "1.20260222.01.00";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
-// ANDROID_VR client — primary for ALL content (incl. YTM-exclusive).
-// Returns direct stream URLs with c=ANDROID_VR; CDN supports HEAD and large range requests.
-// mpv/ffmpeg compatible. Numeric client ID = 28.
-// Versions aligned with yt-dlp 2026-01.
-const ANDROID_VR_CLIENT_NAME: &str = "ANDROID_VR";
-const ANDROID_VR_CLIENT_ID: &str = "28";
-const ANDROID_VR_CLIENT_VERSION: &str = "1.71.26";
-const ANDROID_VR_USER_AGENT: &str =
-    "com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-const ANDROID_VR_API_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+// ANDROID client — primary for ALL content (incl. YTM-exclusive).
+// Returns direct stream URLs with c=ANDROID; CDN supports HEAD and Range requests with User-Agent.
+// mpv/ffmpeg compatible. Numeric client ID = 3.
+const ANDROID_CLIENT_NAME: &str = "ANDROID";
+const ANDROID_CLIENT_ID: &str = "3";
+const ANDROID_CLIENT_VERSION: &str = "21.26.364";
+const ANDROID_SDK_VERSION: u32 = 30;
+const ANDROID_USER_AGENT: &str =
+    "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip";
+const ANDROID_API_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
 // IOS client — faster fallback than TVHTML5 because it usually returns direct URLs.
 // Numeric client ID = 5.
@@ -757,9 +757,8 @@ pub fn more_playlist_tracks(_id: &str, page_token: &str) -> Result<PagedTracks, 
 /// Fetch playable audio stream URLs for a video.
 ///
 /// Strategy order (best CDN compatibility first):
-///   1. ANDROID_VR client → direct URLs, CDN supports HEAD + unlimited Range requests.
+///   1. ANDROID client → direct URLs, CDN supports HEAD and Range requests with User-Agent.
 ///      Best for standard YouTube content and mpv/ffmpeg external players.
-///      Fails with LOGIN_REQUIRED for YTM-exclusive content → falls back.
 ///   2. IOS client → direct URLs, CDN requires bounded Range requests (≤1MB chunks).
 pub fn clear_cached_visitor_data() {
     if let Ok(mut guard) = VISITOR_DATA_CACHE.lock() {
@@ -771,55 +770,30 @@ pub fn clear_cached_visitor_data() {
 }
 
 pub fn get_streams(video_id: &str) -> Result<Vec<StreamSource>, anyhow::Error> {
-    // Get visitor data: prefer cached/seeded first for fast cold start, but always
-    // fall through to a fresh watch-page fetch so a stale token can never cause
-    // a permanent failure.
-    let mut visitor_data = get_cached_visitor_data();
-    if visitor_data.is_none() {
-        ensure_visitor_data_seeded();
-        visitor_data = get_cached_visitor_data();
-        if visitor_data.is_none() {
-            visitor_data = fetch_visitor_data(video_id);
-        }
-    }
+    // Fetch visitor data from the YouTube watch page.
+    let visitor_data = fetch_visitor_data(video_id);
 
-    // --- Strategy 1: ANDROID_VR client ---
-    let fresh_visitor_data: Option<String>;
-    match get_streams_android_vr(video_id, visitor_data.as_deref()) {
+    // --- Strategy 1: ANDROID client ---
+    match get_streams_android(video_id, visitor_data.as_deref()) {
         Ok(streams) if !streams.is_empty() => {
             return Ok(streams);
         }
-        Err(_) | Ok(_) => {
-            // ANDROID_VR failed (or returned no streams), which strongly suggests our
-            // cached/seeded visitorData is stale/invalid. Clear the cache, fetch fresh
-            // visitor data from the YouTube watch page, and retry once.
+        _ => {
+            // ANDROID failed, which strongly suggests our cached visitorData is stale/invalid.
+            // Clear the cache, fetch fresh visitor data, and retry once.
             clear_cached_visitor_data();
-            fresh_visitor_data = fetch_visitor_data(video_id);
+            let fresh_visitor_data = fetch_visitor_data(video_id);
 
-            if let Some(ref fresh) = fresh_visitor_data {
-                if let Ok(streams) = get_streams_android_vr(video_id, Some(fresh.as_str())) {
-                    if !streams.is_empty() {
-                        return Ok(streams);
-                    }
+            if let Ok(streams) = get_streams_android(video_id, fresh_visitor_data.as_deref()) {
+                if !streams.is_empty() {
+                    return Ok(streams);
                 }
-            }
-
-            // Promote the fresh visitor data so subsequent fallbacks (IOS) can use it.
-            if let Some(fresh) = fresh_visitor_data.clone() {
-                visitor_data = Some(fresh);
             }
         }
     }
 
     // --- Strategy 2: IOS client (usually direct URLs; faster than TV cipher path) ---
-    // Always pass the freshest visitor data we have. If we never re-fetched
-    // (i.e. ANDROID_VR returned Ok with empty streams), do a fresh watch-page
-    // fetch now so IOS does not get stuck with the same stale token.
-    let ios_visitor_data: Option<String> = match fresh_visitor_data {
-        Some(fresh) => Some(fresh),
-        None => fetch_visitor_data(video_id).or(visitor_data),
-    };
-    if let Ok(streams) = get_streams_ios(video_id, ios_visitor_data.as_deref()) {
+    if let Ok(streams) = get_streams_ios(video_id, visitor_data.as_deref()) {
         if !streams.is_empty() {
             return Ok(streams);
         }
@@ -829,28 +803,22 @@ pub fn get_streams(video_id: &str) -> Result<Vec<StreamSource>, anyhow::Error> {
     get_streams_tv(video_id)
 }
 
-/// ANDROID_VR client player API call — returns direct stream URLs, CDN supports HEAD.
-///
-/// ANDROID_VR CDN URLs support HTTP HEAD and large Range requests, making them
-/// compatible with mpv, ffmpeg, and other external media players. This client works
-/// for standard YouTube content but returns LOGIN_REQUIRED for YTM-exclusive tracks.
-fn get_streams_android_vr(
+/// ANDROID client player API call — returns direct stream URLs with c=ANDROID.
+fn get_streams_android(
     video_id: &str,
     visitor_data: Option<&str>,
 ) -> Result<Vec<StreamSource>, anyhow::Error> {
     let mut body = json!({
         "context": {
             "client": {
-                "clientName": ANDROID_VR_CLIENT_NAME,
-                "clientVersion": ANDROID_VR_CLIENT_VERSION,
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
-                "androidSdkVersion": 32,
-                "userAgent": ANDROID_VR_USER_AGENT,
+                "clientName": ANDROID_CLIENT_NAME,
+                "clientVersion": ANDROID_CLIENT_VERSION,
+                "androidSdkVersion": ANDROID_SDK_VERSION,
+                "userAgent": ANDROID_USER_AGENT,
                 "hl": "en",
                 "platform": "MOBILE",
                 "osName": "Android",
-                "osVersion": "12L",
+                "osVersion": "11",
                 "timeZone": "UTC",
                 "gl": "US",
                 "utcOffsetMinutes": 0
@@ -872,9 +840,9 @@ fn get_streams_android_vr(
     }
 
     let mut extra_headers: Vec<(&str, &str)> = vec![
-        ("User-Agent", ANDROID_VR_USER_AGENT),
-        ("X-YouTube-Client-Name", ANDROID_VR_CLIENT_ID),
-        ("X-YouTube-Client-Version", ANDROID_VR_CLIENT_VERSION),
+        ("User-Agent", ANDROID_USER_AGENT),
+        ("X-YouTube-Client-Name", ANDROID_CLIENT_ID),
+        ("X-YouTube-Client-Version", ANDROID_CLIENT_VERSION),
     ];
     let vd_owned: String;
     if let Some(vd) = visitor_data {
@@ -882,7 +850,7 @@ fn get_streams_android_vr(
         extra_headers.push(("X-Goog-Visitor-Id", &vd_owned));
     }
 
-    let data = yt_post_to_url(ANDROID_VR_API_URL, body, &extra_headers)?;
+    let data = yt_post_to_url(ANDROID_API_URL, body, &extra_headers)?;
 
     let status = data
         .get("playabilityStatus")
@@ -897,11 +865,12 @@ fn get_streams_android_vr(
             .and_then(|r| r.as_str())
             .unwrap_or("Unknown");
         return Err(anyhow::anyhow!(
-            "ANDROID_VR client: status={status}, reason={reason}"
+            "ANDROID client: status={status}, reason={reason}"
         ));
     }
 
-    let streams = collect_direct_streams(&data);
+    let android_headers = Some(vec![("User-Agent".to_string(), ANDROID_USER_AGENT.to_string())]);
+    let streams = collect_direct_streams_with_headers(&data, android_headers);
     Ok(streams)
 }
 
@@ -974,13 +943,6 @@ fn get_streams_ios(
     Ok(streams)
 }
 
-/// Collect audio streams from a player API response that has direct `url` fields.
-///
-/// ANDROID_VR CDN URLs work without any special headers (mpv/ffmpeg compatible).
-fn collect_direct_streams(data: &Value) -> Vec<StreamSource> {
-    collect_direct_streams_with_headers(data, None)
-}
-
 fn collect_direct_streams_with_headers(
     data: &Value,
     headers: Option<Vec<(String, String)>>,
@@ -1001,27 +963,46 @@ fn collect_direct_streams_with_headers(
         formats.extend(muxed.clone());
     }
 
+    let mut cipher_manifest: Option<cipher::CipherManifest> = None;
+
     let mut streams: Vec<StreamSource> = formats
         .iter()
         .filter(|f| {
             f.get("mimeType")
                 .and_then(|m| m.as_str())
-                .map(|m| {
-                    m.starts_with("audio/")
-                        || (m.starts_with("video/") && (m.contains("mp4a") || m.contains("opus")))
-                })
+                .map(|m| m.starts_with("audio/") || (m.starts_with("video/") && (m.contains("mp4a") || m.contains("opus"))))
                 .unwrap_or(false)
         })
         .filter_map(|f| {
-            let url = f.get("url").and_then(|u| u.as_str())?;
             let mime = f
                 .get("mimeType")
                 .and_then(|m| m.as_str())
                 .unwrap_or("audio/unknown");
             let bitrate = f.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0) as u32;
 
+            let url = if let Some(direct_url) = f.get("url").and_then(|u| u.as_str()) {
+                Some(direct_url.to_string())
+            } else {
+                let cipher_str = f
+                    .get("signatureCipher")
+                    .or_else(|| f.get("cipher"))
+                    .and_then(|c| c.as_str());
+                if let Some(cs) = cipher_str {
+                    if cipher_manifest.is_none() {
+                        cipher_manifest = cipher::get_cipher_manifest().ok();
+                    }
+                    if let Some(ref m) = cipher_manifest {
+                        cipher::decode_stream_url(cs, m).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }?;
+
             Some(mapper::to_stream_source_with_headers(
-                url.to_string(),
+                url,
                 bitrate,
                 mime,
                 headers.clone(),
@@ -1031,6 +1012,11 @@ fn collect_direct_streams_with_headers(
 
     streams.sort_by(|a, b| quality_rank(&b.quality).cmp(&quality_rank(&a.quality)));
     streams
+}
+
+/// Collect audio streams from a player API response that has direct `url` fields.
+fn collect_direct_streams(data: &Value) -> Vec<StreamSource> {
+    collect_direct_streams_with_headers(data, None)
 }
 
 /// TVHTML5 client strategy: fetch cipher manifest, request player,
