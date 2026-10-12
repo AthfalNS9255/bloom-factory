@@ -659,23 +659,28 @@ fn get_all_playlist_items_partner(id: &str, token: &str) -> Result<Vec<Value>, S
                 .map(|n| n as u32);
         }
 
-        all_items.extend(items.iter().cloned());
+        let fetched_len = items.len();
+        all_items.extend(items);
 
         let next_offset = content
             .pointer("/pagingInfo/nextOffset")
             .and_then(Value::as_u64)
             .map(|n| n as u32)
-            .unwrap_or(offset + items.len() as u32);
+            .unwrap_or(offset + fetched_len as u32);
 
-        if items.is_empty() || next_offset <= offset {
+        if fetched_len == 0 || next_offset <= offset {
             break;
         }
         offset = next_offset;
 
+        if fetched_len < limit as usize {
+            break;
+        }
+
         // Safety valve: if Spotify reports a trustworthy higher total, stop once
-        // we reach it. Do not stop early on possibly stale low totals.
+        // we reach it.
         if let Some(t) = total_count {
-            if t > 0 && all_items.len() as u32 >= t && offset >= t {
+            if t > 0 && (all_items.len() as u32 >= t || offset >= t) {
                 break;
             }
         }
@@ -793,11 +798,12 @@ fn get_playlist_tracks_via_partner(id: &str, token: &str) -> Result<Vec<TrackIte
         Err(_) => {}
     }
 
-    // Compatibility fallback for Spotify builds that still expose the
-    // older queryPlaylist persisted query contract.
-    if let Ok(legacy_tracks) = get_playlist_tracks_via_partner_legacy(id, token) {
-        if legacy_tracks.len() > best.len() {
-            best = legacy_tracks;
+    // Compatibility fallback: only query legacy if the modern query returned nothing.
+    if best.is_empty() {
+        if let Ok(legacy_tracks) = get_playlist_tracks_via_partner_legacy(id, token) {
+            if legacy_tracks.len() > best.len() {
+                best = legacy_tracks;
+            }
         }
     }
 
@@ -956,18 +962,7 @@ fn get_playlist_track_count_via_api(id: &str, token: &str) -> Option<u32> {
 }
 
 fn get_playlist_track_count_resilient(id: &str, token: &str) -> Option<u32> {
-    let api_count = get_playlist_track_count_via_api(id, token);
-    let partner_count = get_playlist_tracks_via_partner(id, token)
-        .ok()
-        .map(|tracks| tracks.len() as u32)
-        .filter(|n| *n > 0);
-
-    match (api_count, partner_count) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    get_playlist_track_count_via_api(id, token)
 }
 
 fn entity_from_embed(kind: &str, id: &str) -> Result<Value, String> {
@@ -1361,44 +1356,15 @@ fn get_playlist_tracks_via_api_with_stats(
 }
 
 fn get_playlist_tracks_via_api(id: &str, token: &str) -> Result<Vec<TrackItem>, String> {
-    let (api_tracks, items_processed, declared_total) =
+    let (api_tracks, _items_processed, _declared_total) =
         get_playlist_tracks_via_api_with_stats(id, token)?;
 
-    if declared_total > 0 && items_processed < declared_total {
-        let mut recovered = api_tracks.clone();
-
-        if let Ok((explicit_tracks, _, _)) = get_playlist_tracks_via_api_with_stats(id, token) {
-            if explicit_tracks.len() > recovered.len() {
-                recovered = explicit_tracks;
-            }
-        }
-
-        if let Ok(partner_tracks) = get_playlist_tracks_via_partner(id, token) {
-            if partner_tracks.len() > recovered.len() {
-                recovered = partner_tracks;
-            }
-        }
-
-        return Ok(recovered);
+    if !api_tracks.is_empty() {
+        return Ok(api_tracks);
     }
 
-    if api_tracks.len() >= 100 {
-        if let Ok(partner_tracks) = get_playlist_tracks_via_partner(id, token) {
-            if partner_tracks.len() > api_tracks.len() {
-                return Ok(partner_tracks);
-            }
-        }
-    }
-
-    if api_tracks.is_empty() {
-        if let Ok(partner_tracks) = get_playlist_tracks_via_partner(id, token) {
-            if !partner_tracks.is_empty() {
-                return Ok(partner_tracks);
-            }
-        }
-    }
-
-    Ok(api_tracks)
+    // Fallback to partner API only if Web API returned no tracks
+    get_playlist_tracks_via_partner(id, token)
 }
 
 fn get_album_tracks_via_api(id: &str, token: &str) -> Result<Vec<TrackItem>, String> {
@@ -1506,13 +1472,11 @@ impl Guest for Component {
         match &kind {
             SpotifyKind::Playlist => {
                 if let Ok(tok) = token.as_ref() {
-                    if let Ok(info) = get_playlist_info_via_partner(&id, tok) {
+                    // Try Web API first (fast, single request with complete metadata and total track count)
+                    if let Ok(info) = get_playlist_info_via_api(&id, tok) {
                         return Ok(info);
                     }
-                    if let Ok(mut info) = get_playlist_info_via_api(&id, tok) {
-                        if let Some(count) = get_playlist_track_count_resilient(&id, tok) {
-                            info.track_count = Some(count);
-                        }
+                    if let Ok(info) = get_playlist_info_via_partner(&id, tok) {
                         return Ok(info);
                     }
                 }
@@ -1547,18 +1511,20 @@ impl Guest for Component {
         let items = match &kind {
             SpotifyKind::Playlist => match token {
                 Ok(tok) => {
-                    let partner = get_playlist_tracks_via_partner(&id, &tok).unwrap_or_default();
-                    let api = get_playlist_tracks_via_api(&id, &tok).unwrap_or_default();
-
-                    if !partner.is_empty() || !api.is_empty() {
-                        if partner.len() >= api.len() {
-                            partner
-                        } else {
-                            api
+                    // 1. Prioritize Web API (fastest, direct pagination with limit=100)
+                    if let Ok(tracks) = get_playlist_tracks_via_api(&id, &tok) {
+                        if !tracks.is_empty() {
+                            return Ok(Tracks { items: tracks });
                         }
-                    } else {
-                        get_playlist_tracks_via_embed(&id)?
                     }
+                    // 2. Fallback to Partner GraphQL API
+                    if let Ok(tracks) = get_playlist_tracks_via_partner(&id, &tok) {
+                        if !tracks.is_empty() {
+                            return Ok(Tracks { items: tracks });
+                        }
+                    }
+                    // 3. Last fallback: Embed page HTML
+                    get_playlist_tracks_via_embed(&id)?
                 }
                 Err(_) => get_playlist_tracks_via_embed(&id)?,
             },
